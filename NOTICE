@@ -1,0 +1,11 @@
+NOTICE — Third-Party Inspiration
+=================================
+
+This project's SSE event sequence and adapter architecture were
+inspired by farion1231/cc-switch (MIT License).
+
+Repository: https://github.com/farion1231/cc-switch
+
+No source code was copied verbatim. The implementation patterns
+(adapters, pseudo-streaming, event ordering) were studied and
+reimplemented independently in Node.js.
