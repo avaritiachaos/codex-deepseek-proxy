@@ -48,6 +48,19 @@ const RETRY_BASE_DELAY  = 1000;    // ms
   }
 })();
 
+// ── runtime.json — hot-reload on every request ─────────────────
+const RUNTIME_PATH = path.join(__dirname, '..', 'runtime.json');
+
+function readRuntimeConfig() {
+  try {
+    const raw = fs.readFileSync(RUNTIME_PATH, 'utf-8');
+    return JSON.parse(raw);
+  } catch (e) {
+    log.debug(`runtime.json read failed (${e.message}), using defaults`);
+    return { model: 'deepseek-v4-flash', reasoning_effort: 'high' };
+  }
+}
+
 // ── HTTP helpers ───────────────────────────────────────────────
 
 function readBody(req) {
@@ -109,9 +122,10 @@ function callDeepSeek(chatBody, apiKey) {
 async function handleResponses(req, res, body) {
   const apiKey = process.env.DEEPSEEK_API_KEY;
   const codexWantsStream = body.stream === true;
-  const model = body.model || 'deepseek-chat';
+  const model = body.model || 'deepseek-chat';  // Codex's requested model (for reference)
   const responseId = require('crypto').randomBytes(12).toString('hex');
   const respId = `resp_${responseId}`;
+  let activeModel = model;  // will be updated by runtime config
 
   // Helper: send error to Codex in the format it expects (SSE or JSON)
   function sendError(statusCode, errorMsg, detail) {
@@ -129,7 +143,7 @@ async function handleResponses(req, res, body) {
         response: {
           id: respId, object: 'response',
           created_at: Math.floor(Date.now() / 1000),
-          status: 'in_progress', model, output: [],
+          status: 'in_progress', model: activeModel, output: [],
           usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
           incomplete_details: null, error: null
         }
@@ -139,7 +153,7 @@ async function handleResponses(req, res, body) {
         response: {
           id: respId, object: 'response',
           created_at: Math.floor(Date.now() / 1000),
-          status: 'failed', model, output: [],
+          status: 'failed', model: activeModel, output: [],
           error: { type: 'server_error', code: 'server_error', message: errorMsg }
         }
       };
@@ -164,11 +178,24 @@ async function handleResponses(req, res, body) {
   // ── Convert request ──────────────────────────────────────
   const chatBody = codexToDeepseek(body);
 
+  // ── Apply runtime.json overrides (fresh read, no cache) ──
+  const runtime = readRuntimeConfig();
+  if (runtime.model) {
+    chatBody.model = runtime.model;
+  }
+  if (runtime.reasoning_effort) {
+    chatBody.reasoning_effort = runtime.reasoning_effort;
+  }
+  const upstreamModel = chatBody.model;
+  activeModel = upstreamModel;
+
   // Log conversion details (no API key!)
-  log.debug(`Codex → model=${model} stream=${codexWantsStream} ` +
+  log.debug(`Codex → model=${upstreamModel} stream=${codexWantsStream} ` +
+    `reasoning_effort=${chatBody.reasoning_effort || 'none'} ` +
     `input=${Array.isArray(body.input) ? `array[${body.input.length}]` : typeof body.input} ` +
     `instructions=${body.instructions ? 'yes' : 'no'} ` +
     `tools=${Array.isArray(body.tools) ? body.tools.length : 0}`);
+  log.info(`Runtime: model=${upstreamModel} reasoning_effort=${chatBody.reasoning_effort || 'none'}`);
 
   chatBody.messages.forEach((m, i) => {
     const preview = (typeof m.content === 'string' ? m.content : JSON.stringify(m.content))
@@ -184,7 +211,7 @@ async function handleResponses(req, res, body) {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       if (attempt > 1) {
-        log.info(`Retry ${attempt}/${MAX_RETRIES} for ${model}`);
+        log.info(`Retry ${attempt}/${MAX_RETRIES} for ${upstreamModel}`);
         await sleep(RETRY_BASE_DELAY * (attempt - 1));
       }
 
@@ -198,6 +225,17 @@ async function handleResponses(req, res, body) {
       if (dsRes.statusCode !== 200) {
         // ALWAYS log the full error body for debugging (no key in response)
         log.error(`DeepSeek returned ${dsRes.statusCode}`, rawText.slice(0, 3000));
+
+        // Auto-retry: if 400 mentions reasoning_effort and we have it, strip and retry
+        if (dsRes.statusCode === 400 && chatBody.reasoning_effort) {
+          const errLower = rawText.toLowerCase();
+          if (errLower.includes('reasoning_effort') || errLower.includes('reasoning effort') ||
+              errLower.includes('unsupported_parameter') || errLower.includes('unknown field')) {
+            log.info(`Auto-retry: removing reasoning_effort (DeepSeek rejected it)`);
+            delete chatBody.reasoning_effort;
+            continue;  // retry immediately (uses one attempt slot)
+          }
+        }
 
         if (dsRes.statusCode >= 500 && attempt < MAX_RETRIES) {
           lastError = new Error(`HTTP ${dsRes.statusCode}`);
@@ -275,14 +313,48 @@ const server = http.createServer(async (req, res) => {
 
   // GET /health
   if (method === 'GET' && (url === '/health' || url === '/health/')) {
+    const rt = readRuntimeConfig();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       ok: true,
       proxy:   'codex-deepseek-proxy',
       version: '2.0.0',
       key:     log.maskKey(process.env.DEEPSEEK_API_KEY),
-      mode:    'pseudo-stream'
+      mode:    'pseudo-stream',
+      runtime: rt
     }));
+    return;
+  }
+
+  // GET /admin/route — show current runtime config
+  if (method === 'GET' && url === '/admin/route') {
+    const rt = readRuntimeConfig();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, ...rt }));
+    return;
+  }
+
+  // POST /admin/route — update runtime config (partial merge)
+  if (method === 'POST' && url === '/admin/route') {
+    try {
+      const update = await readBody(req);
+      const current = readRuntimeConfig();
+
+      // Merge only allowed fields
+      if (update.model !== undefined)            current.model = update.model;
+      if (update.reasoning_effort !== undefined)  current.reasoning_effort = update.reasoning_effort;
+
+      // Write back to runtime.json
+      fs.writeFileSync(RUNTIME_PATH, JSON.stringify(current, null, 2) + '\n', 'utf-8');
+      log.info(`Runtime updated via /admin/route: model=${current.model} reasoning_effort=${current.reasoning_effort || 'none'}`);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, ...current }));
+    } catch (err) {
+      log.error('Failed to update runtime.json', err.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: err.message }));
+    }
     return;
   }
 
@@ -311,11 +383,13 @@ const server = http.createServer(async (req, res) => {
 // ── Start ──────────────────────────────────────────────────────
 
 server.listen(PORT, HOST, () => {
+  const rt = readRuntimeConfig();
   log.info('═══════════════════════════════════════════════════');
   log.info('  codex-deepseek-proxy v2.0.0');
   log.info(`  http://${HOST}:${PORT}`);
   log.info(`  Key: ${log.maskKey(process.env.DEEPSEEK_API_KEY)}`);
   log.info(`  Mode: pseudo-stream (non-stream → SSE wrap)`);
+  log.info(`  Runtime: model=${rt.model || 'default'} reasoning_effort=${rt.reasoning_effort || 'none'}`);
   log.info('═══════════════════════════════════════════════════');
   if (!process.env.DEEPSEEK_API_KEY) {
     log.info('WARNING: DEEPSEEK_API_KEY not set! Set it in .env');
