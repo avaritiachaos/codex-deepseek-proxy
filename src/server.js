@@ -108,17 +108,58 @@ function callDeepSeek(chatBody, apiKey) {
 
 async function handleResponses(req, res, body) {
   const apiKey = process.env.DEEPSEEK_API_KEY;
-  if (!apiKey) {
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      type: 'error',
-      error: { type: 'server_error', message: 'DEEPSEEK_API_KEY not set' }
-    }));
-    return;
-  }
-
   const codexWantsStream = body.stream === true;
   const model = body.model || 'deepseek-chat';
+  const responseId = require('crypto').randomBytes(12).toString('hex');
+  const respId = `resp_${responseId}`;
+
+  // Helper: send error to Codex in the format it expects (SSE or JSON)
+  function sendError(statusCode, errorMsg, detail) {
+    if (res.headersSent) return;
+    if (codexWantsStream) {
+      // Must use SSE format — otherwise Codex reports "stream closed before response.completed"
+      res.writeHead(200, {
+        'Content-Type':      'text/event-stream',
+        'Cache-Control':     'no-cache',
+        'Connection':        'keep-alive',
+        'X-Accel-Buffering': 'no'
+      });
+      const created = {
+        type: 'response.created',
+        response: {
+          id: respId, object: 'response',
+          created_at: Math.floor(Date.now() / 1000),
+          status: 'in_progress', model, output: [],
+          usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+          incomplete_details: null, error: null
+        }
+      };
+      const failed = {
+        type: 'response.failed',
+        response: {
+          id: respId, object: 'response',
+          created_at: Math.floor(Date.now() / 1000),
+          status: 'failed', model, output: [],
+          error: { type: 'server_error', code: 'server_error', message: errorMsg }
+        }
+      };
+      res.write(`event: response.created\ndata: ${JSON.stringify(created)}\n\n`);
+      res.write(`event: response.failed\ndata: ${JSON.stringify(failed)}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    } else {
+      res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'server_error', message: errorMsg, detail: detail || undefined }
+      }));
+    }
+  }
+
+  if (!apiKey) {
+    sendError(500, 'DEEPSEEK_API_KEY not set');
+    return;
+  }
 
   // ── Convert request ──────────────────────────────────────
   const chatBody = codexToDeepseek(body);
@@ -163,16 +204,8 @@ async function handleResponses(req, res, body) {
           continue;  // retry on server errors
         }
 
-        // 4xx: return error to Codex
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: {
-            type:    'upstream_error',
-            message: `DeepSeek API error: ${dsRes.statusCode}`,
-            detail:  rawText.slice(0, 1000)
-          }
-        }));
+        // 4xx: return error to Codex (in SSE format if stream requested)
+        sendError(dsRes.statusCode, `DeepSeek API error: ${dsRes.statusCode}`, rawText.slice(0, 1000));
         return;
       }
 
@@ -182,11 +215,7 @@ async function handleResponses(req, res, body) {
         chatResp = JSON.parse(rawText);
       } catch (e) {
         log.error('Failed to parse DeepSeek JSON', rawText.slice(0, 500));
-        res.writeHead(502, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: { type: 'server_error', message: 'Invalid JSON from DeepSeek' }
-        }));
+        sendError(502, 'Invalid JSON from DeepSeek');
         return;
       }
 
@@ -224,13 +253,7 @@ async function handleResponses(req, res, body) {
   // All retries exhausted
   const errMsg = lastError ? lastError.message : 'Unknown error';
   log.error('All retries exhausted', errMsg);
-  if (!res.headersSent) {
-    res.writeHead(502, { 'Content-Type': 'application/json' });
-  }
-  res.end(JSON.stringify({
-    type: 'error',
-    error: { type: 'server_error', message: `Proxy error after ${MAX_RETRIES} attempts: ${errMsg}` }
-  }));
+  sendError(502, `Proxy error after ${MAX_RETRIES} attempts: ${errMsg}`);
 }
 
 // ── HTTP Server ────────────────────────────────────────────────

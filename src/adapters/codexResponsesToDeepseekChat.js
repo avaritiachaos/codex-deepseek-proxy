@@ -168,20 +168,12 @@ function codexResponsesToDeepseekChat(body) {
     collapsed.unshift({ role: 'system', content: systemParts.join('\n\n') });
   }
 
-  // 4. Tools (best-effort)
-  let tools;
+  // 4. Tools — intentionally skipped for now.
+  //    DeepSeek tool calling support is limited and untested.
+  //    We strip tools so the model always returns plain text.
+  //    This ensures simple text tasks succeed reliably.
   if (Array.isArray(body.tools) && body.tools.length > 0) {
-    log.info(`Tool definitions detected (${body.tools.length}) — passing through, may be unstable`);
-    tools = body.tools.map(t => ({
-      type: 'function',
-      function: {
-        name: t.name || (t.function && t.function.name) || '',
-        description: t.description || (t.function && t.function.description) || '',
-        parameters: t.parameters
-          || (t.function && t.function.parameters)
-          || { type: 'object', properties: {} }
-      }
-    }));
+    log.info(`Tool definitions detected (${body.tools.length}) — stripped (tool calling not fully supported yet)`);
   }
 
   // 5. Reasoning effort
@@ -197,8 +189,6 @@ function codexResponsesToDeepseekChat(body) {
   };
 
   if (body.top_p != null)      chatBody.top_p = body.top_p;
-  if (tools)                   chatBody.tools = tools;
-  if (body.tool_choice)        chatBody.tool_choice = body.tool_choice;
   if (reasoningEffort)         chatBody.reasoning_effort = reasoningEffort;
 
   return chatBody;
