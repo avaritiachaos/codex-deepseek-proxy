@@ -36,6 +36,10 @@ const REQUEST_TIMEOUT_MS = 300000;          // 5 min (match Codex stream_idle_ti
 const MAX_RETRIES        = 3;
 const RETRY_DELAY_MS     = 1000;
 
+// Force non-streaming to DeepSeek even when Codex requests stream.
+// Set to true after non-streaming is verified working.
+const ENABLE_REAL_STREAM = true;
+
 const LOG_DIR  = path.join(__dirname, 'logs');
 const LOG_FILE = path.join(LOG_DIR, 'proxy.log');
 
@@ -60,7 +64,6 @@ function log(msg) {
   const ts = new Date().toISOString();
   const line = `[${ts}] ${msg}\n`;
   try { fs.appendFileSync(LOG_FILE, line); } catch (_) { /* ignore */ }
-  // Console: never print full API key
   console.log(line.trimEnd());
 }
 
@@ -85,71 +88,168 @@ function readBody(req) {
   });
 }
 
+// Read a non-streaming response body fully
+function readResponse(res) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    res.on('data', c => chunks.push(c));
+    res.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+    res.on('error', reject);
+  });
+}
+
+// ── Content extraction helper ──────────────────────────────────
+
+/**
+ * Extract plain text from a Responses API content field.
+ * Content can be: string, array of { type, text }, or other.
+ */
+function extractTextContent(content) {
+  if (!content) return '';
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map(p => {
+        if (typeof p === 'string') return p;
+        // Accept all text-like types from Responses API
+        if (p && (p.type === 'input_text' || p.type === 'output_text' || p.type === 'text')) {
+          return p.text || '';
+        }
+        // Fallback: try .text anyway
+        if (p && p.text) return p.text;
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+  if (typeof content === 'object') return JSON.stringify(content);
+  return String(content);
+}
+
+/**
+ * Map Responses API role → DeepSeek-supported Chat Completions role.
+ * DeepSeek only accepts: system, user, assistant, tool
+ */
+function mapRole(role) {
+  if (!role) return 'user';
+  if (role === 'developer') return 'system';  // ← key fix
+  if (['system', 'user', 'assistant', 'tool'].includes(role)) return role;
+  return 'user';  // fallback for any unknown role
+}
+
+/**
+ * Map Codex reasoning effort to DeepSeek reasoning_effort.
+ * medium/low → high,  high → high,  xhigh/max → max
+ */
+function mapReasoningEffort(body) {
+  let effort = null;
+
+  if (body.reasoning && typeof body.reasoning === 'object' && body.reasoning.effort) {
+    effort = body.reasoning.effort;
+  } else if (body.model_reasoning_effort) {
+    effort = body.model_reasoning_effort;
+  } else if (body.reasoning_effort) {
+    effort = body.reasoning_effort;
+  }
+
+  if (!effort) return null;
+
+  const e = String(effort).toLowerCase();
+  if (e === 'low' || e === 'medium') return 'high';
+  if (e === 'high') return 'high';
+  if (e === 'xhigh' || e === 'max') return 'max';
+  return null;  // unknown, don't send
+}
+
 // ── Request conversion: Responses API → Chat Completions ───────
 
 function responsesToChat(body) {
   const messages = [];
 
-  // System / developer instructions
+  // 1. System instructions → system message
   if (body.instructions) {
-    messages.push({ role: 'system', content: body.instructions });
+    const text = extractTextContent(body.instructions);
+    if (text) messages.push({ role: 'system', content: text });
   }
 
-  // Walk input items
-  const items = Array.isArray(body.input) ? body.input : [];
-  for (const item of items) {
-    if (typeof item === 'string') {
-      messages.push({ role: 'user', content: item });
-      continue;
-    }
+  // 2. Convert input → messages
+  const input = body.input;
 
-    switch (item.type) {
-      case 'message': {
-        const parts = Array.isArray(item.content) ? item.content : [];
-        const text  = parts
-          .filter(p => p.type === 'output_text' || p.type === 'input_text' || p.type === 'text')
-          .map(p => p.text || '')
-          .join('\n');
-        if (text) {
-          messages.push({ role: item.role || 'user', content: text });
+  if (typeof input === 'string') {
+    // Simple string input
+    messages.push({ role: 'user', content: input });
+  } else if (Array.isArray(input)) {
+    for (let i = 0; i < input.length; i++) {
+      const item = input[i];
+
+      if (typeof item === 'string') {
+        messages.push({ role: 'user', content: item });
+        continue;
+      }
+
+      if (!item || typeof item !== 'object') continue;
+
+      switch (item.type) {
+        case 'message': {
+          const text = extractTextContent(item.content);
+          if (text) {
+            messages.push({
+              role: mapRole(item.role),
+              content: text
+            });
+          }
+          break;
         }
-        break;
-      }
-      case 'function_call': {
-        messages.push({
-          role: 'assistant',
-          content: null,
-          tool_calls: [{
-            id: item.call_id || genId('call'),
-            type: 'function',
-            function: {
-              name: item.name || '',
-              arguments: typeof item.arguments === 'string'
-                ? item.arguments
-                : JSON.stringify(item.arguments || {})
+
+        case 'function_call': {
+          // Convert Responses function_call → Chat Completions tool_calls
+          messages.push({
+            role: 'assistant',
+            content: null,
+            tool_calls: [{
+              id: item.call_id || genId('call'),
+              type: 'function',
+              function: {
+                name: item.name || '',
+                arguments: typeof item.arguments === 'string'
+                  ? item.arguments
+                  : JSON.stringify(item.arguments || {})
+              }
+            }]
+          });
+          break;
+        }
+
+        case 'function_call_output': {
+          // Convert tool result
+          messages.push({
+            role: 'tool',
+            tool_call_id: item.call_id || '',
+            content: typeof item.output === 'string'
+              ? item.output
+              : JSON.stringify(item.output || '')
+          });
+          break;
+        }
+
+        default: {
+          // Unknown item type — try to extract text, degrade gracefully
+          if (item.content) {
+            const text = extractTextContent(item.content);
+            if (text) {
+              const mappedRole = mapRole(item.role);
+              messages.push({ role: mappedRole, content: text });
+              log(`DEBUG  Degraded item[${i}] type=${item.type || 'none'} role=${item.role} -> role=${mappedRole}`);
             }
-          }]
-        });
-        break;
-      }
-      case 'function_call_output': {
-        messages.push({
-          role: 'tool',
-          tool_call_id: item.call_id || '',
-          content: item.output || ''
-        });
-        break;
-      }
-      default: {
-        // Fallback: try to extract text
-        if (item.content) {
-          const text = Array.isArray(item.content)
-            ? item.content.map(p => p.text || '').join('\n')
-            : String(item.content);
-          if (text) messages.push({ role: item.role || 'user', content: text });
+          } else {
+            log(`DEBUG  Skipped item[${i}] type=${item.type || 'none'} (no extractable content)`);
+          }
         }
       }
     }
+  } else if (input != null) {
+    // input is something unexpected (number, object, etc.)
+    messages.push({ role: 'user', content: String(input) });
   }
 
   // Safety: ensure at least one message
@@ -157,7 +257,7 @@ function responsesToChat(body) {
     messages.push({ role: 'user', content: 'Hello' });
   }
 
-  // Tools
+  // 3. Convert tools (only if present)
   let tools;
   if (Array.isArray(body.tools) && body.tools.length > 0) {
     tools = body.tools.map(t => {
@@ -175,22 +275,52 @@ function responsesToChat(body) {
     });
   }
 
+  // 4. Reasoning effort
+  const reasoningEffort = mapReasoningEffort(body);
+
+  // 5. Build the DeepSeek body — ONLY fields DeepSeek understands
   const chatBody = {
     model: body.model || 'deepseek-chat',
     messages,
-    stream: body.stream === true,
+    stream: ENABLE_REAL_STREAM ? (body.stream === true) : false,
     temperature: body.temperature != null ? body.temperature : 1,
     max_tokens: body.max_output_tokens || body.max_tokens || 4096
   };
 
-  if (tools) chatBody.tools = tools;
+  if (tools)                chatBody.tools = tools;
+  if (body.tool_choice)     chatBody.tool_choice = body.tool_choice;
+  if (reasoningEffort)      chatBody.reasoning_effort = reasoningEffort;
+  if (body.top_p != null)   chatBody.top_p = body.top_p;
 
-  // Pass-through: top_p, presence/frequency_penalty
-  if (body.top_p != null)              chatBody.top_p = body.top_p;
-  if (body.presence_penalty != null)   chatBody.presence_penalty = body.presence_penalty;
-  if (body.frequency_penalty != null)  chatBody.frequency_penalty = body.frequency_penalty;
+  // Do NOT include: input, instructions, metadata, store, include,
+  // previous_response_id, parallel_tool_calls, reasoning (raw object),
+  // presence_penalty, frequency_penalty — DeepSeek may reject them.
 
   return chatBody;
+}
+
+// ── Debug: log both sides of the conversion ────────────────────
+
+function logRequestDebug(codexBody, chatBody) {
+  log(`DEBUG  Codex → model=${codexBody.model}  stream=${codexBody.stream}  ` +
+      `input_type=${Array.isArray(codexBody.input) ? `array[${codexBody.input.length}]` : typeof codexBody.input}  ` +
+      `instructions=${codexBody.instructions ? 'yes' : 'no'}  ` +
+      `tools=${Array.isArray(codexBody.tools) ? codexBody.tools.length : 0}  ` +
+      `max_output_tokens=${codexBody.max_output_tokens || 'n/a'}  ` +
+      `reasoning=${JSON.stringify(codexBody.reasoning || null)}`);
+
+  // Log messages summary (not full text — may be huge)
+  chatBody.messages.forEach((m, i) => {
+    const preview = typeof m.content === 'string'
+      ? m.content.slice(0, 120).replace(/\n/g, ' ')
+      : String(m.content).slice(0, 120);
+    log(`DEBUG  msg[${i}] role=${m.role}  len=${(m.content || '').length}  preview="${preview}"${m.tool_calls ? '  [tool_calls]' : ''}`);
+  });
+
+  // Log the body structure (redact Authorization)
+  const redacted = { ...chatBody };
+  log(`DEBUG  DeepSeek body keys: [${Object.keys(redacted).join(', ')}]`);
+  log(`DEBUG  DeepSeek body (no auth): ${JSON.stringify(redacted).slice(0, 2000)}`);
 }
 
 // ── Response conversion: Chat Completions → Responses API ──────
@@ -199,15 +329,12 @@ function chatToResponse(chatResp, requestBody) {
   const choice  = (chatResp.choices && chatResp.choices[0]) || {};
   const message = choice.message || {};
   const output  = [];
-  const msgId   = genId('msg');
 
   // Text content
-  const textItems = [];
   if (message.content) {
-    const itemId = genId('item');
-    textItems.push({
+    output.push({
       type: 'message',
-      id: itemId,
+      id: genId('msg'),
       status: 'completed',
       role: 'assistant',
       content: [{
@@ -219,10 +346,9 @@ function chatToResponse(chatResp, requestBody) {
   }
 
   // Tool calls
-  const toolItems = [];
   if (Array.isArray(message.tool_calls)) {
     for (const tc of message.tool_calls) {
-      toolItems.push({
+      output.push({
         type: 'function_call',
         id: genId('fc'),
         call_id: tc.id || genId('call'),
@@ -232,14 +358,11 @@ function chatToResponse(chatResp, requestBody) {
     }
   }
 
-  // Build output: tool calls first (Codex expects them before text), then text
-  output.push(...toolItems, ...textItems);
-
   // Fallback: at least one message
   if (output.length === 0) {
     output.push({
       type: 'message',
-      id: genId('item'),
+      id: genId('msg'),
       status: 'completed',
       role: 'assistant',
       content: [{ type: 'output_text', text: '', annotations: [] }]
@@ -263,8 +386,7 @@ function chatToResponse(chatResp, requestBody) {
     max_output_tokens: requestBody.max_output_tokens || null,
     incomplete_details: null,
     error: null,
-    parallel_tool_calls: false,
-    tool_choice: 'auto',
+    tool_choice: requestBody.tool_choice || 'auto',
     tools: requestBody.tools || []
   };
 }
@@ -281,9 +403,8 @@ class StreamEmitter {
     this.started    = false;
     this.currentItemId = null;
 
-    // Accumulated state
     this.textContent    = '';
-    this.toolCalls      = {};   // index → { id, name, arguments }
+    this.toolCalls      = {};
     this.emittedTextItem = false;
     this.finalized       = false;
   }
@@ -312,7 +433,6 @@ class StreamEmitter {
     });
   }
 
-  // Ensure a text message item has been emitted
   _ensureTextItem() {
     this._emitResponseCreated();
     if (this.emittedTextItem) return;
@@ -341,7 +461,6 @@ class StreamEmitter {
     });
   }
 
-  // Close the current text message item
   _closeTextItem() {
     if (!this.emittedTextItem) return;
     this._send('response.content_part.done', {
@@ -369,9 +488,7 @@ class StreamEmitter {
     this.currentItemId   = null;
   }
 
-  // Process a streaming delta
   onDelta(delta) {
-    // Handle text content
     if (delta.content != null && delta.content !== '') {
       this._ensureTextItem();
       this.textContent += delta.content;
@@ -385,19 +502,12 @@ class StreamEmitter {
       });
     }
 
-    // Handle tool_calls
     if (Array.isArray(delta.tool_calls)) {
-      // Close text item first if open
       if (this.emittedTextItem) this._closeTextItem();
-
       for (const tc of delta.tool_calls) {
         const idx = tc.index != null ? tc.index : 0;
         if (!this.toolCalls[idx]) {
-          this.toolCalls[idx] = {
-            id: tc.id || genId('call'),
-            name: '',
-            arguments: ''
-          };
+          this.toolCalls[idx] = { id: tc.id || genId('call'), name: '', arguments: '' };
         }
         if (tc.function) {
           if (tc.function.name)      this.toolCalls[idx].name      += tc.function.name;
@@ -407,14 +517,84 @@ class StreamEmitter {
     }
   }
 
-  // Finish streaming and emit completion events
+  /** Emit a complete response from a non-streaming result as SSE events */
+  emitFromComplete(responseObj) {
+    this._emitResponseCreated();
+
+    const output = responseObj.output || [];
+    for (const item of output) {
+      if (item.type === 'message') {
+        this.currentItemId = item.id || genId('item');
+        this.emittedTextItem = true;
+
+        this._send('response.output_item.added', {
+          type: 'response.output_item.added',
+          response_id: this.responseId,
+          output_index: this.outputIdx,
+          item: { ...item, status: 'in_progress', content: [] }
+        });
+        this._send('response.content_part.added', {
+          type: 'response.content_part.added',
+          response_id: this.responseId,
+          item_id: this.currentItemId,
+          output_index: this.outputIdx,
+          content_index: 0,
+          part: { type: 'output_text', text: '' }
+        });
+
+        // Extract full text
+        const text = (item.content || [])
+          .filter(p => p.type === 'output_text')
+          .map(p => p.text || '')
+          .join('');
+        this.textContent = text;
+
+        this._send('response.output_text.delta', {
+          type: 'response.output_text.delta',
+          response_id: this.responseId,
+          item_id: this.currentItemId,
+          output_index: this.outputIdx,
+          content_index: 0,
+          delta: text
+        });
+
+        this._closeTextItem();
+      } else if (item.type === 'function_call') {
+        this._send('response.output_item.added', {
+          type: 'response.output_item.added',
+          response_id: this.responseId,
+          output_index: this.outputIdx,
+          item
+        });
+        this._send('response.output_item.done', {
+          type: 'response.output_item.done',
+          response_id: this.responseId,
+          output_index: this.outputIdx,
+          item: { ...item, status: 'completed' }
+        });
+        this.outputIdx++;
+      }
+    }
+
+    // response.completed with full output
+    this._send('response.completed', {
+      type: 'response.completed',
+      response: {
+        ...responseObj,
+        status: 'completed'
+      }
+    });
+
+    this.res.end();
+    this.finalized = true;
+  }
+
   finalize() {
     if (this.finalized) return;
     this.finalized = true;
 
     this._emitResponseCreated();
 
-    // Close text item if still open
     if (this.emittedTextItem) {
       this._send('response.output_text.done', {
         type: 'response.output_text.done',
@@ -427,7 +607,6 @@ class StreamEmitter {
       this._closeTextItem();
     }
 
-    // Emit tool call items
     const indices = Object.keys(this.toolCalls).sort((a, b) => a - b);
     for (const idx of indices) {
       const tc     = this.toolCalls[idx];
@@ -436,31 +615,17 @@ class StreamEmitter {
         type: 'response.output_item.added',
         response_id: this.responseId,
         output_index: this.outputIdx,
-        item: {
-          type: 'function_call',
-          id: itemId,
-          call_id: tc.id,
-          name: tc.name,
-          arguments: tc.arguments
-        }
+        item: { type: 'function_call', id: itemId, call_id: tc.id, name: tc.name, arguments: tc.arguments }
       });
       this._send('response.output_item.done', {
         type: 'response.output_item.done',
         response_id: this.responseId,
         output_index: this.outputIdx,
-        item: {
-          type: 'function_call',
-          id: itemId,
-          status: 'completed',
-          call_id: tc.id,
-          name: tc.name,
-          arguments: tc.arguments
-        }
+        item: { type: 'function_call', id: itemId, status: 'completed', call_id: tc.id, name: tc.name, arguments: tc.arguments }
       });
       this.outputIdx++;
     }
 
-    // If nothing was emitted at all, emit an empty message
     if (this.outputIdx === 0) {
       const itemId = genId('item');
       this._send('response.output_item.added', {
@@ -473,14 +638,10 @@ class StreamEmitter {
         type: 'response.output_item.done',
         response_id: this.responseId,
         output_index: 0,
-        item: {
-          type: 'message', id: itemId, status: 'completed', role: 'assistant',
-          content: [{ type: 'output_text', text: '', annotations: [] }]
-        }
+        item: { type: 'message', id: itemId, status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: '', annotations: [] }] }
       });
     }
 
-    // response.completed
     this._send('response.completed', {
       type: 'response.completed',
       response: {
@@ -489,7 +650,7 @@ class StreamEmitter {
         created_at: this.createdAt,
         status: 'completed',
         model: this.model,
-        output: [],  // Codex should have collected items from streamed events
+        output: [],
         usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
         incomplete_details: null,
         error: null
@@ -537,7 +698,7 @@ function callDeepSeek(chatBody, apiKey, attempt = 1) {
       timeout: REQUEST_TIMEOUT_MS
     };
 
-    log(`DeepSeek request  model=${chatBody.model}  stream=${chatBody.stream}  msgs=${chatBody.messages.length}  attempt=${attempt}`);
+    log(`DeepSeek →  model=${chatBody.model}  stream=${chatBody.stream}  msgs=${chatBody.messages.length}  attempt=${attempt}  body_size=${Buffer.byteLength(payload)}B`);
 
     const req = https.request(options, (res) => {
       resolve(res);
@@ -554,16 +715,6 @@ function callDeepSeek(chatBody, apiKey, attempt = 1) {
   });
 }
 
-// Read a non-streaming response body fully
-function readResponse(res) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    res.on('data', c => chunks.push(c));
-    res.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
-    res.on('error', reject);
-  });
-}
-
 // ── Request handler ────────────────────────────────────────────
 
 async function handleResponsesRequest(req, res, body) {
@@ -577,10 +728,20 @@ async function handleResponsesRequest(req, res, body) {
     return;
   }
 
-  const chatBody   = responsesToChat(body);
-  const isStream   = body.stream === true;
-  const responseId = genId('resp');
-  const model      = body.model || chatBody.model;
+  // Convert Codex Responses API → DeepSeek Chat Completions
+  const chatBody = responsesToChat(body);
+
+  // Debug: log both sides
+  logRequestDebug(body, chatBody);
+
+  const codexWantsStream = body.stream === true;
+  const responseId       = genId('resp');
+  const model            = body.model || chatBody.model;
+
+  // If real streaming is disabled, force non-streaming to DeepSeek
+  if (!ENABLE_REAL_STREAM) {
+    chatBody.stream = false;
+  }
 
   let lastError = null;
 
@@ -593,54 +754,137 @@ async function handleResponsesRequest(req, res, body) {
 
       const dsRes = await callDeepSeek(chatBody, apiKey, attempt);
 
-      // ── Non-streaming ──────────────────────────────────────
-      if (!isStream) {
+      // ── Real streaming path ──────────────────────────────
+      if (ENABLE_REAL_STREAM && codexWantsStream && chatBody.stream) {
         if (dsRes.statusCode !== 200) {
           const errBody = await readResponse(dsRes);
-          logError(`DeepSeek returned ${dsRes.statusCode}`, errBody);
+          log(`DeepSeek ←  stream_error status=${dsRes.statusCode}`);
+          log(`DeepSeek ←  error_body=${errBody.slice(0, 2000)}`);
           if (dsRes.statusCode >= 500 && attempt < MAX_RETRIES) {
             lastError = new Error(`HTTP ${dsRes.statusCode}`);
-            continue;  // retry
+            continue;
           }
-          res.writeHead(dsRes.statusCode, { 'Content-Type': 'application/json' });
+          if (!res.headersSent) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+          }
           res.end(JSON.stringify({
             type: 'error',
-            error: { type: 'upstream_error', message: `DeepSeek API error: ${dsRes.statusCode}`, detail: errBody }
+            error: { type: 'upstream_error', message: `DeepSeek API error: ${dsRes.statusCode}`, detail: errBody.slice(0, 1000) }
           }));
           return;
         }
 
-        const raw     = await readResponse(dsRes);
-        let chatResp;
-        try { chatResp = JSON.parse(raw); }
-        catch (e) {
-          logError('Failed to parse DeepSeek response', raw.slice(0, 500));
-          res.writeHead(502, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'error', error: { type: 'server_error', message: 'Invalid JSON from DeepSeek' } }));
-          return;
+        // SSE stream from DeepSeek → convert to Responses API SSE → Codex
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          'X-Accel-Buffering': 'no'
+        });
+
+        const emitter = new StreamEmitter(res, responseId, model);
+        let buffer = '';
+        dsRes.setEncoding('utf-8');
+
+        await new Promise((resolveStream) => {
+          dsRes.on('data', (chunk) => {
+            buffer += chunk;
+            let nlIdx;
+            while ((nlIdx = buffer.indexOf('\n')) !== -1) {
+              const line = buffer.slice(0, nlIdx).trim();
+              buffer = buffer.slice(nlIdx + 1);
+              if (!line || line.startsWith(':')) continue;
+              if (line.startsWith('data: ')) {
+                const data = line.slice(6).trim();
+                if (data === '[DONE]') {
+                  emitter.finalize();
+                  resolveStream();
+                  return;
+                }
+                try {
+                  const parsed = JSON.parse(data);
+                  const delta = (parsed.choices && parsed.choices[0] && parsed.choices[0].delta) || {};
+                  emitter.onDelta(delta);
+                } catch (e) {
+                  logError('SSE parse error', e);
+                }
+              }
+            }
+          });
+          dsRes.on('end', () => {
+            if (!emitter.finalized) emitter.finalize();
+            resolveStream();
+          });
+          dsRes.on('error', (e) => {
+            logError('DeepSeek stream error', e);
+            if (!emitter.finalized) emitter.emitError('Stream error from DeepSeek');
+            resolveStream();
+          });
+        });
+
+        log(`DeepSeek stream OK  model=${model}`);
+        return;
+      }
+
+      // ── Non-streaming path ───────────────────────────────
+      const rawText = await readResponse(dsRes);
+
+      log(`DeepSeek ←  status=${dsRes.statusCode}  body_len=${rawText.length}`);
+      if (dsRes.statusCode !== 200) {
+        log(`DeepSeek ←  error_body=${rawText.slice(0, 2000)}`);
+      } else {
+        log(`DeepSeek ←  body_preview=${rawText.slice(0, 500)}`);
+      }
+
+      // ── Error handling ──────────────────────────────────────
+      if (dsRes.statusCode !== 200) {
+        if (dsRes.statusCode >= 500 && attempt < MAX_RETRIES) {
+          lastError = new Error(`HTTP ${dsRes.statusCode}`);
+          continue;  // retry on server errors
         }
+        if (!res.headersSent) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+        }
+        res.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'upstream_error',
+            message: `DeepSeek API error: ${dsRes.statusCode}`,
+            detail: rawText.slice(0, 1000)
+          }
+        }));
+        return;
+      }
 
-        const responseObj = chatToResponse(chatResp, body);
-        log(`DeepSeek OK  model=${responseObj.model}  tokens=${responseObj.usage.input_tokens}+${responseObj.usage.output_tokens}`);
+      // ── Parse DeepSeek response ─────────────────────────────
+      let chatResp;
+      try { chatResp = JSON.parse(rawText); }
+      catch (e) {
+        logError('Failed to parse DeepSeek JSON', rawText.slice(0, 500));
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+        }
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'server_error', message: 'Invalid JSON from DeepSeek' }
+        }));
+        return;
+      }
 
+      // ── Convert to Responses API format ─────────────────────
+      const responseObj = chatToResponse(chatResp, body);
+      log(`DeepSeek OK  model=${responseObj.model}  ` +
+          `tokens=${responseObj.usage.input_tokens}+${responseObj.usage.output_tokens}  ` +
+          `output_items=${responseObj.output.length}`);
+
+      // ── Return to Codex ─────────────────────────────────────
+      if (!codexWantsStream) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(responseObj));
         return;
       }
 
-      // ── Streaming ──────────────────────────────────────────
-      if (dsRes.statusCode !== 200) {
-        const errBody = await readResponse(dsRes);
-        logError(`DeepSeek stream returned ${dsRes.statusCode}`, errBody);
-        if (dsRes.statusCode >= 500 && attempt < MAX_RETRIES) {
-          lastError = new Error(`HTTP ${dsRes.statusCode}`);
-          continue;
-        }
-        res.writeHead(dsRes.statusCode, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ type: 'error', error: { type: 'upstream_error', message: `DeepSeek API error: ${dsRes.statusCode}` } }));
-        return;
-      }
-
+      // Codex wants stream but we used non-streaming → wrap as SSE
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -648,65 +892,16 @@ async function handleResponsesRequest(req, res, body) {
         'X-Accel-Buffering': 'no'
       });
 
-      const emitter  = new StreamEmitter(res, responseId, model);
-      let streamOk   = true;
-
-      // Line-by-line SSE parser
-      let buffer = '';
-      dsRes.setEncoding('utf-8');
-
-      await new Promise((resolveStream) => {
-        dsRes.on('data', (chunk) => {
-          if (!streamOk) return;
-          buffer += chunk;
-
-          let nlIdx;
-          while ((nlIdx = buffer.indexOf('\n')) !== -1) {
-            const line = buffer.slice(0, nlIdx).trim();
-            buffer = buffer.slice(nlIdx + 1);
-
-            if (!line || line.startsWith(':')) continue;  // comment or empty
-
-            if (line.startsWith('data: ')) {
-              const data = line.slice(6).trim();
-              if (data === '[DONE]') {
-                emitter.finalize();
-                resolveStream();
-                return;
-              }
-              try {
-                const parsed = JSON.parse(data);
-                const delta  = (parsed.choices && parsed.choices[0] && parsed.choices[0].delta) || {};
-                emitter.onDelta(delta);
-              } catch (e) {
-                logError('SSE parse error', e);
-              }
-            }
-          }
-        });
-
-        dsRes.on('end', () => {
-          if (!emitter.finalized) emitter.finalize();
-          resolveStream();
-        });
-
-        dsRes.on('error', (e) => {
-          logError('DeepSeek stream error', e);
-          streamOk = false;
-          if (!emitter.finalized) emitter.emitError('Stream error from DeepSeek');
-          resolveStream();
-        });
-      });
-
-      log(`DeepSeek stream OK  model=${model}`);
-      return;  // success, no retry needed
+      const emitter = new StreamEmitter(res, responseId, model);
+      emitter.emitFromComplete(responseObj);
+      log(`Codex ←  SSE wrapped (non-stream → stream)  model=${model}`);
+      return;
 
     } catch (err) {
       logError(`Attempt ${attempt} failed`, err);
       lastError = err;
 
-      // For streaming, if headers already sent we cannot retry
-      if (isStream && res.headersSent) {
+      if (res.headersSent) {
         if (!res.writableEnded) {
           const emitter = new StreamEmitter(res, responseId, model);
           emitter.emitError(err.message);
@@ -736,7 +931,7 @@ const server = http.createServer(async (req, res) => {
   const url = req.url;
   const method = req.method;
 
-  // CORS headers (just in case)
+  // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -753,8 +948,9 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       proxy: 'codex-deepseek-proxy',
-      version: '1.0.0',
-      deepseek_key: maskKey(process.env.DEEPSEEK_API_KEY)
+      version: '1.1.0',
+      deepseek_key: maskKey(process.env.DEEPSEEK_API_KEY),
+      stream_mode: ENABLE_REAL_STREAM ? 'real' : 'non-stream-to-deepseek'
     }));
     return;
   }
@@ -763,7 +959,7 @@ const server = http.createServer(async (req, res) => {
   if (method === 'POST' && (url === '/v1/responses' || url === '/responses')) {
     try {
       const body = await readBody(req);
-      log(`Incoming request  ${method} ${url}  model=${body.model || '?'}  stream=${body.stream}`);
+      log(`═══ Incoming  ${method} ${url}  model=${body.model || '?'}  stream=${body.stream} ═══`);
       await handleResponsesRequest(req, res, body);
     } catch (err) {
       logError('Request handling error', err);
@@ -787,16 +983,17 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   log('═══════════════════════════════════════════════════════');
-  log('  codex-deepseek-proxy v1.0.0');
+  log('  codex-deepseek-proxy v1.1.0');
   log(`  Listening on http://${HOST}:${PORT}`);
   log(`  Health check: http://${HOST}:${PORT}/health`);
   log(`  DeepSeek API key: ${maskKey(process.env.DEEPSEEK_API_KEY)}`);
   log(`  DEEPSEEK_HOST: ${DEEPSEEK_HOST}`);
+  log(`  Stream mode: ${ENABLE_REAL_STREAM ? 'real streaming' : 'non-stream → SSE wrap'}`);
   log('═══════════════════════════════════════════════════════');
 
   if (!process.env.DEEPSEEK_API_KEY) {
     log('WARNING: DEEPSEEK_API_KEY is not set! Requests will fail.');
-    log('Set it via: setx DEEPSEEK_API_KEY "your-key"');
+    log('Set it in .env or via: setx DEEPSEEK_API_KEY "your-key"');
   }
 });
 
@@ -807,7 +1004,6 @@ function shutdown(signal) {
     log('Server closed.');
     process.exit(0);
   });
-  // Force close after 5s
   setTimeout(() => process.exit(0), 5000);
 }
 
