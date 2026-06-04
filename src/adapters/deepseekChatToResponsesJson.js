@@ -35,12 +35,13 @@ function deepseekChatToResponsesJson(chatResp, reqBody) {
     });
   }
 
-  // Tool calls → function_call items (best-effort)
+  // Tool calls → function_call items
   if (Array.isArray(message.tool_calls)) {
     for (const tc of message.tool_calls) {
       output.push({
         type:      'function_call',
         id:        genId('fc'),
+        status:    'completed',
         call_id:   tc.id || genId('call'),
         name:      (tc.function && tc.function.name) || '',
         arguments: (tc.function && tc.function.arguments) || '{}'
@@ -59,9 +60,13 @@ function deepseekChatToResponsesJson(chatResp, reqBody) {
     });
   }
 
-  // Determine status from finish_reason
+  // Determine status and end_turn from finish_reason
+  // 'tool_calls' means model wants to call tools → end_turn = false
+  // 'stop' means model finished normally → end_turn = true
+  // 'length' means truncated → status = incomplete
   const finishReason = choice.finish_reason || 'stop';
   const status = finishReason === 'length' ? 'incomplete' : 'completed';
+  const endTurn = finishReason !== 'tool_calls';
 
   return {
     id:         genId('resp'),
@@ -79,7 +84,8 @@ function deepseekChatToResponsesJson(chatResp, reqBody) {
     top_p:               reqBody.top_p != null ? reqBody.top_p : 1,
     max_output_tokens:   reqBody.max_output_tokens || null,
     incomplete_details:  status === 'incomplete' ? { reason: 'max_output_tokens' } : null,
-    error:               null
+    error:               null,
+    end_turn:            endTurn
   };
 }
 

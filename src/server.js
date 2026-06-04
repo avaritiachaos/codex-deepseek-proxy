@@ -220,9 +220,14 @@ async function handleResponses(req, res, body) {
       }
 
       // Log success preview
-      const textPreview = (chatResp.choices && chatResp.choices[0] &&
-        chatResp.choices[0].message && chatResp.choices[0].message.content || '').slice(0, 200);
-      log.debug(`DeepSeek OK  text_preview="${textPreview.replace(/\n/g, ' ')}"`);
+      const choice0  = chatResp.choices && chatResp.choices[0];
+      const msg0     = choice0 && choice0.message;
+      const textPreview = (msg0 && msg0.content || '').slice(0, 200);
+      const toolCalls = msg0 && msg0.tool_calls;
+      log.debug(`DeepSeek OK  finish=${choice0 && choice0.finish_reason}  ` +
+        `text="${textPreview.replace(/\n/g, ' ')}"  ` +
+        `tool_calls=${toolCalls ? toolCalls.length : 0}` +
+        (toolCalls ? ` [${toolCalls.map(tc => tc.function && tc.function.name).join(', ')}]` : ''));
 
       // ── Build Responses API object ───────────────────────
       const respObj = chatToRespJson(chatResp, body);

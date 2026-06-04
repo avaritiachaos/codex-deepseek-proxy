@@ -38,7 +38,7 @@ function extractText(content) {
       if (p && ['input_text', 'output_text', 'text'].includes(p.type)) {
         return p.text || '';
       }
-      if (p && p.text) return p.text;            // best-effort fallback
+      if (p && p.text) return p.text;
       log.debug(`Unsupported content type: ${p && p.type}`);
       return '';
     }).filter(Boolean).join('\n');
@@ -62,6 +62,54 @@ function mapReasoningEffort(body) {
   return null;
 }
 
+/**
+ * Convert Responses API tools to Chat Completions format.
+ * Only keeps tools with type "function" and a valid non-empty name.
+ * Skips web_search_preview, code_interpreter, mcp, etc.
+ */
+function convertTools(codexTools) {
+  if (!Array.isArray(codexTools)) return null;
+
+  const converted = [];
+  const skipped = [];
+
+  for (let i = 0; i < codexTools.length; i++) {
+    const t = codexTools[i];
+
+    // Extract name from various possible locations
+    const name = t.name || (t.function && t.function.name) || null;
+
+    // Only accept function-type tools with valid names
+    if (!name || typeof name !== 'string' || name.trim() === '') {
+      skipped.push({ index: i, type: t.type || 'unknown', reason: 'no valid name' });
+      continue;
+    }
+
+    // Skip non-function tool types
+    if (t.type && t.type !== 'function' && !t.function) {
+      skipped.push({ index: i, type: t.type, reason: 'not a function tool' });
+      continue;
+    }
+
+    converted.push({
+      type: 'function',
+      function: {
+        name: name.trim(),
+        description: (t.description || (t.function && t.function.description) || '').slice(0, 1024),
+        parameters: t.parameters
+          || (t.function && t.function.parameters)
+          || { type: 'object', properties: {} }
+      }
+    });
+  }
+
+  if (skipped.length > 0) {
+    log.info(`Tools: skipped ${skipped.length} invalid: ${skipped.map(s => `[${s.index}]${s.type}(${s.reason})`).join(', ')}`);
+  }
+
+  return converted.length > 0 ? converted : null;
+}
+
 // ── main converter ─────────────────────────────────────────────
 
 /**
@@ -78,13 +126,28 @@ function codexResponsesToDeepseekChat(body) {
   }
 
   // 2. input → messages
+  //    Track consecutive function_calls to group them into one assistant message
   const input = body.input;
   if (typeof input === 'string') {
     messages.push({ role: 'user', content: input });
   } else if (Array.isArray(input)) {
+    let pendingToolCalls = [];
+
+    const flushToolCalls = () => {
+      if (pendingToolCalls.length > 0) {
+        messages.push({
+          role: 'assistant',
+          content: null,
+          tool_calls: pendingToolCalls
+        });
+        pendingToolCalls = [];
+      }
+    };
+
     for (let i = 0; i < input.length; i++) {
       const item = input[i];
       if (typeof item === 'string') {
+        flushToolCalls();
         messages.push({ role: 'user', content: item });
         continue;
       }
@@ -92,30 +155,27 @@ function codexResponsesToDeepseekChat(body) {
 
       switch (item.type) {
         case 'message': {
+          flushToolCalls();
           const text = extractText(item.content);
           if (text) messages.push({ role: mapRole(item.role), content: text });
           break;
         }
         case 'function_call': {
-          log.info('Tool calling not fully supported — converting to assistant message');
-          messages.push({
-            role: 'assistant',
-            content: null,
-            tool_calls: [{
-              id: item.call_id || genId('call'),
-              type: 'function',
-              function: {
-                name: item.name || '',
-                arguments: typeof item.arguments === 'string'
-                  ? item.arguments
-                  : JSON.stringify(item.arguments || {})
-              }
-            }]
+          // Group consecutive function_calls into one assistant message
+          pendingToolCalls.push({
+            id: item.call_id || genId('call'),
+            type: 'function',
+            function: {
+              name: item.name || '',
+              arguments: typeof item.arguments === 'string'
+                ? item.arguments
+                : JSON.stringify(item.arguments || {})
+            }
           });
           break;
         }
         case 'function_call_output': {
-          log.info('Tool calling not fully supported — converting tool result');
+          flushToolCalls();
           messages.push({
             role: 'tool',
             tool_call_id: item.call_id || '',
@@ -126,7 +186,7 @@ function codexResponsesToDeepseekChat(body) {
           break;
         }
         default: {
-          // Unknown item — try text extraction, degrade gracefully
+          flushToolCalls();
           if (item.content) {
             const text = extractText(item.content);
             if (text) {
@@ -139,6 +199,7 @@ function codexResponsesToDeepseekChat(body) {
         }
       }
     }
+    flushToolCalls(); // flush any remaining tool calls
   } else if (input != null) {
     messages.push({ role: 'user', content: String(input) });
   }
@@ -148,8 +209,7 @@ function codexResponsesToDeepseekChat(body) {
     messages.push({ role: 'user', content: 'Hello' });
   }
 
-  // 3. Collapse consecutive system messages to head (DeepSeek may reject
-  //    system messages not at position 0 for some models)
+  // 3. Collapse consecutive system messages to head
   const collapsed = [];
   const systemParts = [];
   for (const m of messages) {
@@ -164,16 +224,13 @@ function codexResponsesToDeepseekChat(body) {
     }
   }
   if (systemParts.length > 0) {
-    // Prepend remaining system messages to the very first message
     collapsed.unshift({ role: 'system', content: systemParts.join('\n\n') });
   }
 
-  // 4. Tools — intentionally skipped for now.
-  //    DeepSeek tool calling support is limited and untested.
-  //    We strip tools so the model always returns plain text.
-  //    This ensures simple text tasks succeed reliably.
-  if (Array.isArray(body.tools) && body.tools.length > 0) {
-    log.info(`Tool definitions detected (${body.tools.length}) — stripped (tool calling not fully supported yet)`);
+  // 4. Convert tools (filter out invalid ones)
+  const tools = convertTools(body.tools);
+  if (tools) {
+    log.info(`Tools: ${tools.length} valid function tools passed to DeepSeek`);
   }
 
   // 5. Reasoning effort
@@ -188,8 +245,10 @@ function codexResponsesToDeepseekChat(body) {
     max_tokens: body.max_output_tokens || body.max_tokens || 4096
   };
 
-  if (body.top_p != null)      chatBody.top_p = body.top_p;
-  if (reasoningEffort)         chatBody.reasoning_effort = reasoningEffort;
+  if (body.top_p != null)   chatBody.top_p = body.top_p;
+  if (tools)                chatBody.tools = tools;
+  if (body.tool_choice)     chatBody.tool_choice = body.tool_choice;
+  if (reasoningEffort)      chatBody.reasoning_effort = reasoningEffort;
 
   return chatBody;
 }
