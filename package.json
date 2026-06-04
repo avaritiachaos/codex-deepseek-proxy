@@ -1,0 +1,11 @@
+{
+  "name": "codex-deepseek-proxy",
+  "version": "1.0.0",
+  "description": "OpenAI Responses API proxy for DeepSeek V4, designed for Codex CLI",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "private": true,
+  "license": "MIT"
+}
